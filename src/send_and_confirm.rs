@@ -2,7 +2,7 @@ use std::{io::Write, time::Duration};
 
 use colored::*;
 use solana_client::{
-    client_error::{ClientError, ClientErrorKind, Result as ClientResult}, nonblocking::rpc_client::RpcClient, rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig}
+    client_error::{ClientError, ClientErrorKind, Result as ClientResult}, nonblocking::rpc_client::RpcClient, rpc_config::{RpcSendTransactionConfig}
 };
 use solana_program::{
     instruction::Instruction,
@@ -132,7 +132,6 @@ impl Miner {
 
         // Set compute units
         let mut final_ixs = vec![];
-        let mut cus = 0;
         match compute_budget {
             ComputeBudget::Dynamic => {
                 // TODO simulate? and now; magick
@@ -147,7 +146,7 @@ impl Miner {
                 let blockhash = client.get_latest_blockhash().await.unwrap();
                 let signers = &[&signer  as &dyn Signer];
                 let tx = Transaction::new_signed_with_payer(&to_sim, Some(&signer.pubkey()), signers, blockhash);
-                cus = client.simulate_transaction(&tx).await.unwrap().value.units_consumed.unwrap();
+                let mut cus = client.simulate_transaction(&tx).await.unwrap().value.units_consumed.unwrap();
                 if cus == 0 {
                     cus = 1_400_000;
                 }

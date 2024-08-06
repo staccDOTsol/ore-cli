@@ -1,4 +1,4 @@
-use solana_sdk::{compute_budget, signature::Signer};
+use solana_sdk::{signature::Signer};
 
 use crate::{send_and_confirm::ComputeBudget, utils::proof_pubkey, Miner};
 
