@@ -1,17 +1,15 @@
-use std::time::Duration;
+use std::{io::Write, time::Duration};
 
 use colored::*;
 use solana_client::{
-    client_error::{ClientError, ClientErrorKind, Result as ClientResult},
-    rpc_config::RpcSendTransactionConfig,
+    client_error::{ClientError, ClientErrorKind, Result as ClientResult}, nonblocking::rpc_client::RpcClient, rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig}
 };
 use solana_program::{
     instruction::Instruction,
     native_token::{lamports_to_sol, sol_to_lamports},
 };
-use solana_rpc_client::spinner;
 use solana_sdk::{
-    commitment_config::CommitmentLevel,
+    commitment_config::{CommitmentConfig, CommitmentLevel},
     compute_budget::ComputeBudgetInstruction,
     signature::{Signature, Signer},
     transaction::Transaction,
@@ -24,15 +22,94 @@ const MIN_SOL_BALANCE: f64 = 0.005;
 
 const RPC_RETRIES: usize = 0;
 const _SIMULATION_RETRIES: usize = 4;
-const GATEWAY_RETRIES: usize = 150;
-const CONFIRM_RETRIES: usize = 1;
-
-const CONFIRM_DELAY: u64 = 0;
-const GATEWAY_DELAY: u64 = 300;
+const GATEWAY_RETRIES: usize = usize::MAX-1;
+const CONFIRM_RETRIES: usize = usize::MAX-1;
 
 pub enum ComputeBudget {
     Dynamic,
     Fixed(u32),
+}
+
+const NONCE_RENT: u64 = 1_447_680;
+
+pub struct NonceManager {
+    pub rpc_client: std::sync::Arc<RpcClient>,
+    pub authority: solana_sdk::pubkey::Pubkey,
+    pub capacity: u64,
+    pub idx: u64,
+}
+
+impl NonceManager {
+    pub fn new(rpc_client: std::sync::Arc<RpcClient>, authority: solana_sdk::pubkey::Pubkey, capacity: u64) -> Self {
+        NonceManager {
+            rpc_client,
+            authority,
+            capacity,
+            idx: 0,
+        }
+    }
+
+    pub async fn try_init_all(&mut self, payer: &solana_sdk::signer::keypair::Keypair) -> Vec<Result<Signature, solana_client::client_error::ClientError>> {
+        let (blockhash, _) = self.rpc_client
+            .get_latest_blockhash_with_commitment(CommitmentConfig::finalized()).await
+            .unwrap_or_default();
+        let mut sigs = vec![];
+        for _ in 0..self.capacity {
+            let nonce_account = self.next();
+            let ixs = self.maybe_create_ixs(&nonce_account.pubkey()).await;
+            if ixs.is_none() {
+                continue;
+            }
+            let ixs = ixs.unwrap();
+            let tx = Transaction::new_signed_with_payer(&ixs, Some(&payer.pubkey()), &[&payer, &nonce_account], blockhash);
+            sigs.push(self.rpc_client.send_transaction(&tx).await);
+        }
+        sigs
+    }
+
+    fn next_seed(&mut self) -> u64 {
+        let ret = self.idx;
+        self.idx = (self.idx + 1) % self.capacity;
+        ret
+    }
+
+    pub fn next(&mut self) -> solana_sdk::signer::keypair::Keypair {
+        let seed = format!("Nonce:{}:{}", self.authority.clone(), self.next_seed());
+        let seed = sha256::digest(seed.as_bytes());
+        let kp = solana_sdk::signer::keypair::keypair_from_seed(&seed.as_ref()).unwrap();
+        kp
+    }
+
+    pub async fn maybe_create_ixs(&mut self, nonce: &solana_sdk::pubkey::Pubkey) -> Option<Vec<Instruction>> {
+        if solana_client::nonce_utils::nonblocking::get_account(&self.rpc_client, nonce).await.is_ok() {
+            None
+        } else {
+            Some(solana_sdk::system_instruction::create_nonce_account(
+                    &self.authority,
+                    &nonce,
+                    &self.authority,
+                    NONCE_RENT,
+            ))
+        }
+    }
+}
+use std::collections::HashSet;
+
+fn extract_pubkeys_from_instructions(instructions: &[Instruction]) -> Vec<String> {
+    let mut pubkeys = HashSet::new();
+
+    for ix in instructions {
+        // Add the program_id
+        pubkeys.insert(ix.program_id);
+
+        // Add all account pubkeys
+        for account_meta in &ix.accounts {
+            pubkeys.insert(account_meta.pubkey);
+        }
+    }
+
+    // Convert the HashSet to a Vec of Strings
+    pubkeys.into_iter().map(|pubkey| pubkey.to_string()).collect()
 }
 
 impl Miner {
@@ -40,11 +117,25 @@ impl Miner {
         &self,
         ixs: &[Instruction],
         compute_budget: ComputeBudget,
-        skip_confirm: bool,
+        _skip_confirm: bool,
     ) -> ClientResult<Signature> {
-        let progress_bar = spinner::new_progress_bar();
         let signer = self.signer();
-        let client = self.rpc_client.clone();
+        let client =  std::sync::Arc::new(RpcClient::new_with_commitment(self.rpc_client.url(), CommitmentConfig::confirmed()));
+        let mut nonce_manager = NonceManager::new(client.clone(), signer.pubkey(), 10 as u64);
+            nonce_manager.try_init_all(&signer).await; 
+
+            nonce_manager.try_init_all(&signer).await; 
+
+
+            nonce_manager.try_init_all(&signer).await; 
+
+
+            nonce_manager.try_init_all(&signer).await; 
+
+
+            nonce_manager.try_init_all(&signer).await; 
+
+
 
         // Return error, if balance is zero
         if let Ok(balance) = client.get_balance(&signer.pubkey()).await {
@@ -62,8 +153,56 @@ impl Miner {
         let mut final_ixs = vec![];
         match compute_budget {
             ComputeBudget::Dynamic => {
-                // TODO simulate
-                final_ixs.push(ComputeBudgetInstruction::set_compute_unit_limit(1_400_000))
+                // TODO simulate? and now; magick
+                let mut to_sim = final_ixs.clone();
+                to_sim.push(ComputeBudgetInstruction::set_compute_unit_price(
+                    self.priority_fee,
+                ));
+                to_sim.push(ComputeBudgetInstruction::set_compute_unit_limit(1_400_000));
+                to_sim.extend_from_slice(ixs);
+
+                        
+                // Build tx
+                let sim_cfg = RpcSimulateTransactionConfig {
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    min_context_slot: None,
+                    ..RpcSimulateTransactionConfig::default()
+                };
+                let tx = Transaction::new_with_payer(&to_sim, Some(&signer.pubkey()));
+
+                // Assume `to_sim` is your vector of instructions
+                let relevant_pubkeys = extract_pubkeys_from_instructions(&to_sim);
+
+                let accounts_config = RpcSimulateTransactionAccountsConfig {
+                    encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                    addresses: relevant_pubkeys,
+                };
+
+                let sim_cfg = RpcSimulateTransactionConfig {
+                    sig_verify: true,
+                    replace_recent_blockhash: false,
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    accounts: Some(accounts_config),
+                    min_context_slot: None,
+                    inner_instructions: true,
+                };
+
+                // Now you can use this sim_cfg in your simulate_transaction_with_config call
+                let tx = Transaction::new_with_payer(&to_sim, Some(&signer.pubkey()));
+                let simulation_result = client.simulate_transaction_with_config(&tx, sim_cfg.clone()).await?;
+
+                // Access the units consumed
+                let units_consumed = simulation_result.value.units_consumed.unwrap_or(0);
+                println!("Units consumed: {}", units_consumed);
+
+                let mut cus = client.simulate_transaction_with_config(&tx, sim_cfg).await.unwrap().value.units_consumed.unwrap();
+                if cus == 0 {
+                    cus = 1_400_000;
+                }
+                println!("Cus {:?}", cus);
+                final_ixs.push(ComputeBudgetInstruction::set_compute_unit_limit(cus as u32));
+
             }
             ComputeBudget::Fixed(cus) => {
                 final_ixs.push(ComputeBudgetInstruction::set_compute_unit_limit(cus))
@@ -82,7 +221,14 @@ impl Miner {
             max_retries: Some(RPC_RETRIES),
             min_context_slot: None,
         };
-        let mut tx = Transaction::new_with_payer(&final_ixs, Some(&signer.pubkey()));
+        
+       let msg = solana_sdk::message::Message::new_with_nonce( 
+        ixs.to_vec(),
+        Some(&signer.pubkey()), 
+            &nonce_manager.next().pubkey(), 
+            &signer.pubkey());
+
+        let mut tx = Transaction::new_unsigned(msg.clone());
 
         // Sign tx
         let (hash, _slot) = client
@@ -90,90 +236,97 @@ impl Miner {
             .await
             .unwrap();
         tx.sign(&[&signer], hash);
-
-        // Submit tx
         let mut attempts = 0;
-        loop {
-            progress_bar.set_message(format!("Submitting transaction... (attempt {})", attempts));
-            match client.send_transaction_with_config(&tx, send_cfg).await {
-                Ok(sig) => {
-                    // Skip confirmation
-                    if skip_confirm {
-                        progress_bar.finish_with_message(format!("Sent: {}", sig));
-                        return Ok(sig);
+
+        let res = client.send_transaction_with_config(&tx, send_cfg.clone()).await;
+        match res {
+            Ok(sig) => {
+
+             let client_clone = client.clone();
+                    let sig_clone = sig;
+                    let tx_clone = tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::confirm_transaction(client_clone, &mut vec![sig_clone], tx_clone).await {
+                            println!("Background confirmation error: {:?}", e);
+                        }
+                    });
+                    Ok(sig)
+                }
+                Err(err) => {
+                    println!("Error: {:?}", err);
+                    attempts += 1;
+                    if attempts.gt(&GATEWAY_RETRIES) {
+                        return Err(ClientError {
+                            request: None,
+                            kind: ClientErrorKind::Custom("Max retries".into()),
+                        });
                     }
+                    println!("Transaction did not land");
+                    return Err(err);
+                }
+            }
+    }
+async fn confirm_transaction(client: std::sync::Arc<RpcClient>, sigs : &mut Vec<Signature>,
+tx: Transaction
+) -> Result<(), ClientError> {
+    let mut attempts = 0;
+    loop {
+        // Use async sleep to delay without blocking
+       tokio::time::sleep(Duration::from_secs((1.1*attempts as f64) as u64)).await;
+        println!("Checking transaction statuses {:?}", sigs);
+        match client.get_signature_statuses(&sigs).await {
+            Ok(statuses) => {
+                // Process the statuses to check if the transaction is confirmed...
+                for status in statuses.value.iter() {
+                    if let Some(status) = status {
+                        if let Some(confirmation_status) = &status.confirmation_status {
+                            match confirmation_status {
+                                TransactionConfirmationStatus::Confirmed
+                                | TransactionConfirmationStatus::Finalized => {
+                                    println!("---!");
+                                    println!("Transaction confirmed!");
+                                    println!("---!");
+                                    println!("---!");
+                                    // append it to file, appending txs.csv
+                                    // append
+                                    let mut file = std::fs::OpenOptions::new()
+                                        .append(true)
+                                        .create(true)
+                                        .open("txs.csv")
+                                        .unwrap();
+                                    file.write_all(format!("{:?}\n", tx.signatures).as_bytes()).unwrap();
 
-                    // Confirm the tx landed
-                    for _ in 0..CONFIRM_RETRIES {
-                        std::thread::sleep(Duration::from_millis(CONFIRM_DELAY));
-                        match client.get_signature_statuses(&[sig]).await {
-                            Ok(signature_statuses) => {
-                                for status in signature_statuses.value {
-                                    if let Some(status) = status {
-                                        if let Some(err) = status.err {
-                                            progress_bar.finish_with_message(format!(
-                                                "{}: {}",
-                                                "ERROR".bold().red(),
-                                                err
-                                            ));
-                                            return Err(ClientError {
-                                                request: None,
-                                                kind: ClientErrorKind::Custom(err.to_string()),
-                                            });
-                                        }
-                                        if let Some(confirmation) = status.confirmation_status {
-                                            match confirmation {
-                                                TransactionConfirmationStatus::Processed => {}
-                                                TransactionConfirmationStatus::Confirmed
-                                                | TransactionConfirmationStatus::Finalized => {
-                                                    progress_bar.finish_with_message(format!(
-                                                        "{} {}",
-                                                        "OK".bold().green(),
-                                                        sig
-                                                    ));
-                                                    return Ok(sig);
-                                                }
-                                            }
-                                        }
-                                    }
+
+
+
+                                    return Ok(());
+                                },
+                                _ => {
+                                    println!("Transaction not confirmed yet...");
+                                    sigs.push(client.send_transaction(&tx.clone()).await?);
                                 }
-                            }
-
-                            // Handle confirmation errors
-                            Err(err) => {
-                                progress_bar.set_message(format!(
-                                    "{}: {}",
-                                    "ERROR".bold().red(),
-                                    err.kind().to_string()
-                                ));
                             }
                         }
                     }
                 }
-
-                // Handle submit errors
-                Err(err) => {
-                    progress_bar.set_message(format!(
-                        "{}: {}",
-                        "ERROR".bold().red(),
-                        err.kind().to_string()
-                    ));
-                }
+            },
+            Err(err) => {
+                println!("Error checking transaction status: {:?}", err);
             }
+ }
 
-            // Retry
-            std::thread::sleep(Duration::from_millis(GATEWAY_DELAY));
-            attempts += 1;
-            if attempts > GATEWAY_RETRIES {
-                progress_bar.finish_with_message(format!("{}: Max retries", "ERROR".bold().red()));
-                return Err(ClientError {
-                    request: None,
-                    kind: ClientErrorKind::Custom("Max retries".into()),
-                });
-            }
+        attempts += 1;
+        let _ = client.send_transaction(&tx.clone()).await;
+
+        println!("Confirmation attempts: {:?}", attempts);
+        if attempts >= CONFIRM_RETRIES as u64 {
+            return Err(ClientError {
+                request: None,
+                kind: ClientErrorKind::Custom("Confirmation attempts exceeded".into()),
+            });
         }
     }
-
+}
     // TODO
     fn _simulate(&self) {
 

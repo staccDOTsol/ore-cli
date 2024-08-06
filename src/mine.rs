@@ -20,7 +20,6 @@ use crate::{
     utils::{amount_u64_to_string, get_clock, get_config, get_proof_with_authority, proof_pubkey},
     Miner,
 };
-
 impl Miner {
     pub async fn mine(&self, args: MineArgs) {
         // Register, if needed.
