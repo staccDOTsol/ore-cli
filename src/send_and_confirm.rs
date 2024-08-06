@@ -24,7 +24,7 @@ const RPC_RETRIES: usize = 0;
 const _SIMULATION_RETRIES: usize = 4;
 const GATEWAY_RETRIES: usize = usize::MAX-1;
 const CONFIRM_RETRIES: usize = usize::MAX-1;
-
+#[derive(Debug)]
 pub enum ComputeBudget {
     Dynamic,
     Fixed(u32),
@@ -93,25 +93,6 @@ impl NonceManager {
         }
     }
 }
-use std::collections::HashSet;
-
-fn extract_pubkeys_from_instructions(instructions: &[Instruction]) -> Vec<String> {
-    let mut pubkeys = HashSet::new();
-
-    for ix in instructions {
-        // Add the program_id
-        pubkeys.insert(ix.program_id);
-
-        // Add all account pubkeys
-        for account_meta in &ix.accounts {
-            pubkeys.insert(account_meta.pubkey);
-        }
-    }
-
-    // Convert the HashSet to a Vec of Strings
-    pubkeys.into_iter().map(|pubkey| pubkey.to_string()).collect()
-}
-
 impl Miner {
     pub async fn send_and_confirm(
         &self,
@@ -151,6 +132,7 @@ impl Miner {
 
         // Set compute units
         let mut final_ixs = vec![];
+        let mut cus = 0;
         match compute_budget {
             ComputeBudget::Dynamic => {
                 // TODO simulate? and now; magick
@@ -158,49 +140,17 @@ impl Miner {
                 to_sim.push(ComputeBudgetInstruction::set_compute_unit_price(
                     self.priority_fee,
                 ));
-                to_sim.push(ComputeBudgetInstruction::set_compute_unit_limit(1_400_000));
                 to_sim.extend_from_slice(ixs);
 
                         
-                // Build tx
-                let sim_cfg = RpcSimulateTransactionConfig {
-                    encoding: Some(UiTransactionEncoding::Base64),
-                    min_context_slot: None,
-                    ..RpcSimulateTransactionConfig::default()
-                };
-                let tx = Transaction::new_with_payer(&to_sim, Some(&signer.pubkey()));
-
-                // Assume `to_sim` is your vector of instructions
-                let relevant_pubkeys = extract_pubkeys_from_instructions(&to_sim);
-
-                let accounts_config = RpcSimulateTransactionAccountsConfig {
-                    encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
-                    addresses: relevant_pubkeys,
-                };
-
-                let sim_cfg = RpcSimulateTransactionConfig {
-                    sig_verify: true,
-                    replace_recent_blockhash: false,
-                    commitment: Some(CommitmentConfig::confirmed()),
-                    encoding: Some(UiTransactionEncoding::Base64),
-                    accounts: Some(accounts_config),
-                    min_context_slot: None,
-                    inner_instructions: true,
-                };
-
                 // Now you can use this sim_cfg in your simulate_transaction_with_config call
-                let tx = Transaction::new_with_payer(&to_sim, Some(&signer.pubkey()));
-                let simulation_result = client.simulate_transaction_with_config(&tx, sim_cfg.clone()).await?;
-
-                // Access the units consumed
-                let units_consumed = simulation_result.value.units_consumed.unwrap_or(0);
-                println!("Units consumed: {}", units_consumed);
-
-                let mut cus = client.simulate_transaction_with_config(&tx, sim_cfg).await.unwrap().value.units_consumed.unwrap();
+                let blockhash = client.get_latest_blockhash().await.unwrap();
+                let signers = &[&signer  as &dyn Signer];
+                let tx = Transaction::new_signed_with_payer(&to_sim, Some(&signer.pubkey()), signers, blockhash);
+                cus = client.simulate_transaction(&tx).await.unwrap().value.units_consumed.unwrap();
                 if cus == 0 {
                     cus = 1_400_000;
                 }
-                println!("Cus {:?}", cus);
                 final_ixs.push(ComputeBudgetInstruction::set_compute_unit_limit(cus as u32));
 
             }

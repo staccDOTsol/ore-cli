@@ -64,7 +64,7 @@ impl Miner {
                 find_bus(),
                 solution,
             ));
-            self.send_and_confirm(&ixs, ComputeBudget::Fixed(compute_budget), false)
+            self.send_and_confirm(&ixs, ComputeBudget::Dynamic, false)
                 .await
                 .ok();
         }
